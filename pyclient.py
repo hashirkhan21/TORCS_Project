@@ -80,6 +80,7 @@ while not shutdownClient:
         buf = None
         try:
             buf, addr = sock.recvfrom(1000)
+            buf = buf.decode()
         except socket.error as msg:
             print ("didn't get response from server...")
         
@@ -109,7 +110,7 @@ while not shutdownClient:
         
         if buf != None:
             try:
-                sock.sendto(buf, (arguments.host_ip, arguments.host_port))
+                sock.sendto(buf.encode(), (arguments.host_ip, arguments.host_port))
             except socket.error as msg:
                 print ("Failed to send data...Exiting...")
                 sys.exit(-1)
