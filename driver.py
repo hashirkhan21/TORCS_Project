@@ -8,6 +8,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 import os
 import pickle
+import joblib
 
 class Driver(object):
     '''
@@ -45,93 +46,44 @@ class Driver(object):
         self.load_or_train_models()
         
     def load_or_train_models(self):
-        """Load existing models if available, otherwise train new ones from CSV data"""
-        models_exist = os.path.exists('steer_model.pkl') and os.path.exists('gear_model.pkl') and os.path.exists('accel_model.pkl')
-        
-        if models_exist:
-            print("Loading existing models...")
-            self.steer_model = pickle.load(open('steer_model.pkl', 'rb'))
-            self.gear_model = pickle.load(open('gear_model.pkl', 'rb'))
-            self.accel_model = pickle.load(open('accel_model.pkl', 'rb'))
-        else:
-            print("Training new models from CSV data...")
-            try:
-                # Try to find a CSV file in the current directory
-                csv_files = [f for f in os.listdir('.') if f.endswith('.csv')]
-                if csv_files:
-                    print(f"Found CSV file(s): {csv_files}")
-                    self.train_models_from_csv(csv_files[0])  # Use the first CSV file found
-                else:
-                    print("No CSV files found. Using fallback driving logic.")
-            except Exception as e:
-                print(f"Error training models: {e}")
-                print("Using fallback driving logic")
-    
-    
-
-
-    def train_models_from_csv(self, csv_path, normalize=True):
-        """Train Random Forest models from CSV data with preprocessing"""
+        """Only load pre-trained models from disk"""
         try:
-            # Load driving data
-            data = pd.read_csv(csv_path)
-            print(f"[INFO] Loaded data: {data.shape[0]} rows, {data.shape[1]} columns")
+            print("[INFO] Loading existing models...")
+            self.steer_model = joblib.load("steer_model.pkl")
+            self.gear_model = joblib.load("gear_model.pkl")
+            self.accel_model = joblib.load("accel_model.pkl")
+            print("[✓] Models loaded successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to load models: {e}")
+            print("Using fallback driving logic.")
 
-            # Drop unused metadata columns
-            for col in ['parser', 'sensors', 'actions', 'parser.1']:
-                if col in data.columns:
-                    data = data.drop(col, axis=1)
-                    print(f"[INFO] Dropped column: {col}")
 
-            # Expand list-like columns into numeric columns
-            def expand_column(df, col_name):
-                if col_name in df.columns:
-                    print(f"[INFO] Expanding column: {col_name}")
-                    try:
-                        expanded = df[col_name].apply(ast.literal_eval)
-                        expanded_df = pd.DataFrame(expanded.tolist(), index=df.index)
-                        expanded_df.columns = [f"{col_name}_{i}" for i in range(expanded_df.shape[1])]
-                        df = df.drop(col_name, axis=1)
-                        df = pd.concat([df, expanded_df], axis=1)
-                    except Exception as e:
-                        print(f"[WARN] Failed to expand column '{col_name}': {e}")
-                return df
+    
 
-            for col in ['track', 'opponents', 'wheelSpinVel', 'focus']:
-                data = expand_column(data, col)
+    def train_models_from_preprocessed(self, preprocessed_csv_path):
+        """Train models from already preprocessed CSV and save them"""
+        try:
+            data = pd.read_csv(preprocessed_csv_path)
 
-            print(f"[INFO] Data after expansion: {data.shape[0]} rows, {data.shape[1]} columns")
-
-            # Validate float convertibility
-            for col in data.columns:
-                try:
-                    data[col] = data[col].astype(float)
-                except Exception as e:
-                    print(f"❌ Column '{col}' cannot be converted to float: {e}")
-                    return
-
-            # Optional: Normalize the data
-            if normalize:
-                print("[INFO] Normalizing data...")
-                scaler = StandardScaler()
-                data = pd.DataFrame(scaler.fit_transform(data), columns=data.columns)
-
-            # Define your targets (example: steering, acceleration, brake)
             target_columns = ['steer', 'accel', 'brake']
             feature_columns = [col for col in data.columns if col not in target_columns]
 
-            print(f"[INFO] Using features: {feature_columns}")
-            print(f"[INFO] Using targets: {target_columns}")
+            print(f"[INFO] Training on features: {feature_columns}")
+            print(f"[INFO] Targets: {target_columns}")
 
             self.models = {}
             for target in target_columns:
                 model = RandomForestRegressor(n_estimators=100, random_state=42)
                 model.fit(data[feature_columns], data[target])
                 self.models[target] = model
-                print(f"[✓] Trained model for {target}")
-
+                pickle.dump(model, open(f'{target}_model.pkl', 'wb'))
+                print(f"[✓] Trained and saved model for '{target}'")
+            
+           
+            
         except Exception as e:
-            print(f"[ERROR] Failed to train models from CSV: {e}")
+            print(f"[ERROR] Failed to train models from preprocessed data: {e}")
+
 
     
     def init(self):
@@ -161,9 +113,24 @@ class Driver(object):
         
         return self.control.toMsg()
     
+    def set_throttle(self, value):
+        if value <= 0:
+            self.control.setBrake(-value)
+            self.control.setAccel(0)
+        else:
+            self.control.setAccel(value)
+            self.control.setBrake(0)
+
     def model_drive(self):
         """Use trained models to drive the car"""
         # Extract features from the current state
+        if self.state.getDistRaced() < 5:
+            self.control.setAccel(1.0)
+            self.control.setBrake(0.0)
+            self.control.setSteer(0.0)
+            self.control.setGear(1)
+            return self.control.toMsg()
+
         features = self.extract_features()
         
         # Make predictions if we have all needed features
@@ -180,10 +147,9 @@ class Driver(object):
             
             # Predict acceleration
             accel_value = self.accel_model.predict([features])[0]
-            self.control.setAccel(np.clip(accel_value, 0.0, 1.0))
+            self.control.set_throttle(np.clip(accel_value, 0.0, 1.0))
             
-            # Set brake to 0 since we're only modeling acceleration and we don't want both applied
-            self.control.setBrake(0)
+          
             
             # Store the current RPM for the next cycle
             self.prev_rpm = self.state.getRpm()
