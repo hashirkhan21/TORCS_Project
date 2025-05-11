@@ -3,7 +3,9 @@ import carState
 import carControl
 import pandas as pd
 import numpy as np
+import ast
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
 import os
 import pickle
 
@@ -65,62 +67,72 @@ class Driver(object):
                 print(f"Error training models: {e}")
                 print("Using fallback driving logic")
     
-    def train_models_from_csv(self, csv_path):
-        """Train Random Forest models from CSV data"""
+    
+
+
+    def train_models_from_csv(self, csv_path, normalize=True):
+        """Train Random Forest models from CSV data with preprocessing"""
         try:
+            # Load driving data
             data = pd.read_csv(csv_path)
-            for col in ['parser', 'sensor']:
+            print(f"[INFO] Loaded data: {data.shape[0]} rows, {data.shape[1]} columns")
+
+            # Drop unused metadata columns
+            for col in ['parser', 'sensors', 'actions', 'parser.1']:
                 if col in data.columns:
                     data = data.drop(col, axis=1)
+                    print(f"[INFO] Dropped column: {col}")
 
-            available_features = []
-            for feature in self.features:
-                if feature in data.columns:
-                    available_features.append(feature)
-            
-            if 'track' in data.columns:
-                available_features.append('track')
-            
-            # Add additional features that exist in the dataset
-            additional_features = ['curLapTime', 'damage', 'distFromS', 'distRaced', 
-                                  'lastLapTime', 'opponents', 'racePos', 'wheelSpinVel']
-            for feature in additional_features:
-                if feature in data.columns:
-                    available_features.append(feature)
-                    if feature not in self.features:
-                        self.features.append(feature)
-            
-            print(f"Using features: {available_features}")
-            X = data[available_features]
-            
-            # Train steering model
-            y_steer = data['steer']
-            self.steer_model = RandomForestRegressor(n_estimators=100, random_state=42)
-            self.steer_model.fit(X, y_steer)
-            print("Steering model trained")
-            
-            # Train gear model
-            y_gear = data['gear'].astype(int)
-            self.gear_model = RandomForestRegressor(n_estimators=100, random_state=42)
-            self.gear_model.fit(X, y_gear)
-            print("Gear model trained")
-            
-            # Train acceleration model
-            y_accel = data['accel']
-            self.accel_model = RandomForestRegressor(n_estimators=100, random_state=42)
-            self.accel_model.fit(X, y_accel)
-            print("Acceleration model trained")
-            
-            # Save trained models
-            pickle.dump(self.steer_model, open('steer_model.pkl', 'wb'))
-            pickle.dump(self.gear_model, open('gear_model.pkl', 'wb'))
-            pickle.dump(self.accel_model, open('accel_model.pkl', 'wb'))
-            
-            print("Models trained and saved successfully")
-            
+            # Expand list-like columns into numeric columns
+            def expand_column(df, col_name):
+                if col_name in df.columns:
+                    print(f"[INFO] Expanding column: {col_name}")
+                    try:
+                        expanded = df[col_name].apply(ast.literal_eval)
+                        expanded_df = pd.DataFrame(expanded.tolist(), index=df.index)
+                        expanded_df.columns = [f"{col_name}_{i}" for i in range(expanded_df.shape[1])]
+                        df = df.drop(col_name, axis=1)
+                        df = pd.concat([df, expanded_df], axis=1)
+                    except Exception as e:
+                        print(f"[WARN] Failed to expand column '{col_name}': {e}")
+                return df
+
+            for col in ['track', 'opponents', 'wheelSpinVel', 'focus']:
+                data = expand_column(data, col)
+
+            print(f"[INFO] Data after expansion: {data.shape[0]} rows, {data.shape[1]} columns")
+
+            # Validate float convertibility
+            for col in data.columns:
+                try:
+                    data[col] = data[col].astype(float)
+                except Exception as e:
+                    print(f"❌ Column '{col}' cannot be converted to float: {e}")
+                    return
+
+            # Optional: Normalize the data
+            if normalize:
+                print("[INFO] Normalizing data...")
+                scaler = StandardScaler()
+                data = pd.DataFrame(scaler.fit_transform(data), columns=data.columns)
+
+            # Define your targets (example: steering, acceleration, brake)
+            target_columns = ['steer', 'accel', 'brake']
+            feature_columns = [col for col in data.columns if col not in target_columns]
+
+            print(f"[INFO] Using features: {feature_columns}")
+            print(f"[INFO] Using targets: {target_columns}")
+
+            self.models = {}
+            for target in target_columns:
+                model = RandomForestRegressor(n_estimators=100, random_state=42)
+                model.fit(data[feature_columns], data[target])
+                self.models[target] = model
+                print(f"[✓] Trained model for {target}")
+
         except Exception as e:
-            print(f"Failed to train models from CSV: {e}")
-            raise
+            print(f"[ERROR] Failed to train models from CSV: {e}")
+
     
     def init(self):
         '''Return init string with rangefinder angles'''

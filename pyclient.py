@@ -65,6 +65,7 @@ while not shutdownClient:
             
         try:
             buf, addr = sock.recvfrom(1000)
+            buf = buf.decode()
         except socket.error as msg:
             print ("didn't get response from server...")
     
