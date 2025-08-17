@@ -4,11 +4,11 @@ import carControl
 import pandas as pd
 import numpy as np
 import ast
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
+from model_manager import ModelManager
 import os
-import pickle
-import joblib
+import threading
+import queue
+from datetime import datetime
 
 class Driver(object):
     '''
@@ -37,54 +37,108 @@ class Driver(object):
             'distRaced', 'fuel'
         ]
         
-        # Models for steering, gear, and acceleration
-        self.steer_model = None
-        self.gear_model = None
-        self.accel_model = None
+        # Add track sensors to features (19 sensors)
+        for i in range(19):
+            self.features.append(f'track_{i}')
         
-        # Try to load existing models or train new ones
-        self.load_or_train_models()
+        print(f"[INFO] Initialized with {len(self.features)} features: {self.features}")
         
-    def load_or_train_models(self):
-        """Only load pre-trained models from disk"""
-        try:
-            print("[INFO] Loading existing models...")
-            self.steer_model = joblib.load("steer_model.pkl")
-            self.gear_model = joblib.load("gear_model.pkl")
-            self.accel_model = joblib.load("accel_model.pkl")
-            print("[✓] Models loaded successfully.")
-        except Exception as e:
-            print(f"[ERROR] Failed to load models: {e}")
-            print("Using fallback driving logic.")
-
-
+        # Initialize model manager
+        self.model_manager = ModelManager()
+        
+        # Data collection
+        self.data_queue = queue.Queue()
+        self.collecting_data = False
+        self.data_thread = None
+        self.min_samples_for_training = 1000
+        self.training_interval = 5000
+        
+        # Start data collection
+        self.start_data_collection()
     
-
-    def train_models_from_preprocessed(self, preprocessed_csv_path):
-        """Train models from already preprocessed CSV and save them"""
+    def start_data_collection(self):
+        """Start the data collection thread"""
+        self.collecting_data = True
+        self.data_thread = threading.Thread(target=self._collect_data_loop)
+        self.data_thread.daemon = True
+        self.data_thread.start()
+    
+    def _collect_data_loop(self):
+        """Background thread for collecting and processing data"""
+        collected_data = []
+        sample_count = 0
+        print("[INFO] Starting data collection loop...")
+        
+        while self.collecting_data:
+            try:
+                data = self.data_queue.get(timeout=1.0)
+                collected_data.append(data)
+                sample_count += 1
+                
+                if sample_count % 100 == 0:  # Print progress every 100 samples
+                    print(f"[INFO] Collected {sample_count} samples")
+                
+                if sample_count >= self.training_interval:
+                    print(f"[INFO] Collected {sample_count} samples, starting training...")
+                    # Save collected data
+                    df = pd.DataFrame(collected_data)
+                    df.to_csv('preprocessed_data.csv', index=False)
+                    print(f"[INFO] Saved {len(df)} samples to preprocessed_data.csv")
+                    
+                    # Train models
+                    self.model_manager.train_models('preprocessed_data.csv')
+                    
+                    collected_data = []
+                    sample_count = 0
+                    print("[INFO] Training completed, resetting sample counter")
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[ERROR] Error in data collection: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    def collect_current_state(self):
+        """Collect current state data for training"""
         try:
-            data = pd.read_csv(preprocessed_csv_path)
-
-            target_columns = ['steer', 'accel', 'brake']
-            feature_columns = [col for col in data.columns if col not in target_columns]
-
-            print(f"[INFO] Training on features: {feature_columns}")
-            print(f"[INFO] Targets: {target_columns}")
-
-            self.models = {}
-            for target in target_columns:
-                model = RandomForestRegressor(n_estimators=100, random_state=42)
-                model.fit(data[feature_columns], data[target])
-                self.models[target] = model
-                pickle.dump(model, open(f'{target}_model.pkl', 'wb'))
-                print(f"[✓] Trained and saved model for '{target}'")
+            state_data = {
+                'angle': self.state.angle,
+                'trackPos': self.state.trackPos,
+                'speedX': self.state.getSpeedX(),
+                'speedY': self.state.getSpeedY(),
+                'speedZ': self.state.getSpeedZ(),
+                'rpm': self.state.getRpm(),
+                'gear': self.state.getGear(),
+                'distRaced': self.state.getDistRaced(),
+                'fuel': self.state.getFuel(),
+                'steer': self.control.getSteer(),
+                'accel': self.control.getAccel(),
+                'gear': self.control.getGear()
+            }
             
-           
+            # Add track sensors
+            track_sensors = self.state.getTrack()
+            if track_sensors:
+                for i, sensor in enumerate(track_sensors):
+                    state_data[f'track_{i}'] = sensor
+            
+            # Ensure all features are present in collected data
+            for feature in self.features:
+                if feature not in state_data:
+                    state_data[feature] = 0.0
+            
+            # Verify feature count
+            if len(state_data) != len(self.features) + 3:  # +3 for steer, accel, gear
+                print(f"[WARNING] Feature count mismatch. Expected {len(self.features) + 3}, got {len(state_data)}")
+                print(f"Features: {list(state_data.keys())}")
+            
+            self.data_queue.put(state_data)
             
         except Exception as e:
-            print(f"[ERROR] Failed to train models from preprocessed data: {e}")
-
-
+            print(f"[ERROR] Error collecting state data: {e}")
+            import traceback
+            traceback.print_exc()
     
     def init(self):
         '''Return init string with rangefinder angles'''
@@ -103,159 +157,207 @@ class Driver(object):
     def drive(self, msg):
         self.state.setFromMsg(msg)
         
-        if self.steer_model and self.gear_model and self.accel_model:
+        # Collect data for training
+        self.collect_current_state()
+        
+        # Use model predictions if available, otherwise use basic driving
+        if all(model is not None for model in self.model_manager.models.values()):
             self.model_drive()
         else:
-            # Fallback to original driving logic
-            self.steer()
-            self.gear()
-            self.speed()
+            self.basic_drive()
         
         return self.control.toMsg()
     
-    def set_throttle(self, value):
-        if value <= 0:
-            self.control.setBrake(-value)
-            self.control.setAccel(0)
-        else:
-            self.control.setAccel(value)
-            self.control.setBrake(0)
-
     def model_drive(self):
         """Use trained models to drive the car"""
-        # Extract features from the current state
+        # Initial movement sequence
         if self.state.getDistRaced() < 5:
             self.control.setAccel(1.0)
             self.control.setBrake(0.0)
             self.control.setSteer(0.0)
             self.control.setGear(1)
             return self.control.toMsg()
-
-        features = self.extract_features()
         
-        # Make predictions if we have all needed features
+        # Additional check for very low speeds
+        if self.state.getSpeedX() < 2.0:
+            self.control.setAccel(1.0)
+            self.control.setBrake(0.0)
+            self.control.setGear(1)
+            return self.control.toMsg()
+        
         try:
-            # Predict steering
-            steer_value = self.steer_model.predict([features])[0]
-            self.control.setSteer(np.clip(steer_value, -1.0, 1.0))
+            # Extract features
+            features = self.extract_features()
             
-            # Predict gear
-            gear_value = int(round(self.gear_model.predict([features])[0]))
-            # Ensure gear is valid (between -1 and 6)
-            gear_value = max(-1, min(6, gear_value))
-            self.control.setGear(gear_value)
+            # Get predictions
+            predictions = self.model_manager.predict(features)
             
-            # Predict acceleration
-            accel_value = self.accel_model.predict([features])[0]
-            self.control.set_throttle(np.clip(accel_value, 0.0, 1.0))
-            
-          
-            
-            # Store the current RPM for the next cycle
-            self.prev_rpm = self.state.getRpm()
-            
-            # Print occasional status
-            if self.state.getDistRaced() % 100 < 1:
-                print(f"Distance: {self.state.getDistRaced():.1f}, Speed: {self.state.getSpeedX():.1f}, " + 
-                      f"Steering: {steer_value:.3f}, Accel: {accel_value:.2f}, Gear: {gear_value}")
-            
+            if predictions:
+                # Apply predictions with safety checks
+                steer_value = np.clip(predictions['steer'], -1.0, 1.0)
+                self.control.setSteer(steer_value)
+                
+                # Gear control with safety
+                gear_value = int(round(predictions['gear']))
+                gear_value = max(-1, min(6, gear_value))
+                
+                # Additional gear safety
+                rpm = self.state.getRpm()
+                speed = self.state.getSpeedX()
+                
+                if speed < 3.0:
+                    gear_value = 1
+                elif rpm < 1000 and gear_value > 1:
+                    gear_value = 1
+                elif rpm > 7000 and gear_value < 6:
+                    gear_value += 1
+                elif rpm < 3000 and gear_value > 1:
+                    gear_value -= 1
+                
+                self.control.setGear(gear_value)
+                
+                # Speed and acceleration control with safety
+                accel_value = np.clip(predictions['accel'], 0.0, 1.0)
+                
+                # Speed control
+                if speed > 95:  # Start braking at high speeds
+                    accel_value = 0.0
+                    self.control.setBrake(0.5)  # Apply moderate braking
+                elif speed > 90:  # Reduce acceleration at high speeds
+                    accel_value = min(accel_value, 0.3)
+                    self.control.setBrake(0.0)
+                elif speed < 5.0:  # Full acceleration at low speeds
+                    accel_value = 1.0
+                    self.control.setBrake(0.0)
+                elif rpm < 2000 and gear_value == 1:  # High acceleration in first gear
+                    accel_value = max(accel_value, 0.9)
+                    self.control.setBrake(0.0)
+                elif rpm > 6500:  # Reduce acceleration at high RPM
+                    accel_value = min(accel_value, 0.8)
+                    self.control.setBrake(0.0)
+                else:
+                    self.control.setBrake(0.0)
+                
+                # Apply acceleration
+                self.set_throttle(accel_value)
+                
+                # Print status
+                if self.state.getDistRaced() % 100 < 1:
+                    print(f"Distance: {self.state.getDistRaced():.1f}, Speed: {self.state.getSpeedX():.1f}, " + 
+                          f"Steering: {steer_value:.3f}, Accel: {accel_value:.2f}, Gear: {gear_value}, RPM: {rpm}")
+            else:
+                self.basic_drive()
+                
         except Exception as e:
             print(f"Error during model prediction: {e}")
-            # Fallback to original driving logic
-            self.steer()
-            self.gear()
-            self.speed()
+            self.basic_drive()
     
-    def extract_features(self):
-        """Extract features from the current state to feed into the model"""
-        # Start with basic features
-        feature_dict = {
-            'angle': self.state.angle,
-            'trackPos': self.state.trackPos,
-            'speedX': self.state.getSpeedX(),
-            'speedY': self.state.getSpeedY(),
-            'speedZ': self.state.getSpeedZ(),
-            'rpm': self.state.getRpm(),
-            'gear': self.state.getGear(),
-            'distRaced': self.state.getDistRaced(),
-            'fuel': self.state.getFuel()
-        }
+    def basic_drive(self):
+        """Basic driving logic when models are not available"""
+        # Initial movement
+        if self.state.getSpeedX() < 2.0:
+            self.control.setAccel(1.0)
+            self.control.setBrake(0.0)
+            self.control.setGear(1)
+            return
         
-        # Add track sensors if we're using them
-        if 'track' in self.features:
-            track_sensors = self.state.getTrack()
-            if track_sensors and len(track_sensors) > 0:
-                # Use the middle sensor reading if there are multiple
-                feature_dict['track'] = track_sensors[len(track_sensors) // 2]
-        
-        # Add additional features if they're being used by our models
-        if 'curLapTime' in self.features:
-            feature_dict['curLapTime'] = self.state.getCurLapTime()
-        if 'damage' in self.features:
-            feature_dict['damage'] = self.state.getDamage()
-        if 'distFromS' in self.features:
-            feature_dict['distFromS'] = self.state.getDistFromStart()
-        if 'lastLapTime' in self.features:
-            feature_dict['lastLapTime'] = self.state.getLastLapTime()
-        if 'racePos' in self.features:
-            feature_dict['racePos'] = self.state.getRacePos()
-        
-        # Convert to list in the same order as self.features
-        feature_values = []
-        for feature in self.features:
-            if feature in feature_dict:
-                feature_values.append(feature_dict[feature])
-            else:
-                # Use a default value if the feature is not available
-                feature_values.append(0)
-        
-        return feature_values
-    
-    # Original methods kept as fallback
-    def steer(self):
+        # Basic steering
         angle = self.state.angle
         dist = self.state.trackPos
-        
         self.control.setSteer((angle - dist*0.5)/self.steer_lock)
-    
-    def gear(self):
+        
+        # Basic gear control
         rpm = self.state.getRpm()
         gear = self.state.getGear()
         
-        if self.prev_rpm == None:
+        if self.prev_rpm is None:
             up = True
         else:
-            if (self.prev_rpm - rpm) < 0:
-                up = True
-            else:
-                up = False
+            up = (self.prev_rpm - rpm) < 0
         
-        if up and rpm > 7000:
+        if up and rpm > 6000:
             gear += 1
-        
-        if not up and rpm < 3000:
+        elif not up and rpm < 4000:
             gear -= 1
         
+        gear = max(-1, min(6, gear))
         self.control.setGear(gear)
         self.prev_rpm = rpm
-    
-    def speed(self):
+        
+        # Basic speed control with braking
         speed = self.state.getSpeedX()
-        accel = self.control.getAccel()
-        
-        if speed < self.max_speed:
-            accel += 0.1
-            if accel > 1:
-                accel = 1.0
+        if speed > 95:  # Start braking at high speeds
+            self.control.setAccel(0.0)
+            self.control.setBrake(0.5)  # Apply moderate braking
+        elif speed > 90:  # Reduce acceleration at high speeds
+            self.control.setAccel(0.3)
+            self.control.setBrake(0.0)
+        elif speed < self.max_speed:
+            self.control.setAccel(1.0)
+            self.control.setBrake(0.0)
         else:
-            accel -= 0.1
-            if accel < 0:
-                accel = 0.0
-        
-        self.control.setAccel(accel)
+            self.control.setAccel(0.0)
+            self.control.setBrake(0.0)
+    
+    def set_throttle(self, value):
+        """Set throttle with brake/accel split"""
+        if value <= 0:
+            self.control.setBrake(-value)
+            self.control.setAccel(0)
+        else:
+            self.control.setAccel(value)
+            self.control.setBrake(0)
+    
+    def extract_features(self):
+        """Extract features from current state"""
+        try:
+            feature_dict = {
+                'angle': self.state.angle,
+                'trackPos': self.state.trackPos,
+                'speedX': self.state.getSpeedX(),
+                'speedY': self.state.getSpeedY(),
+                'speedZ': self.state.getSpeedZ(),
+                'rpm': self.state.getRpm(),
+                'gear': self.state.getGear(),
+                'distRaced': self.state.getDistRaced(),
+                'fuel': self.state.getFuel()
+            }
             
+            # Add track sensors
+            track_sensors = self.state.getTrack()
+            if track_sensors:
+                for i, sensor in enumerate(track_sensors):
+                    feature_dict[f'track_{i}'] = sensor
+            
+            # Ensure all features are present in order
+            feature_values = []
+            for feature in self.features:
+                if feature in feature_dict:
+                    feature_values.append(feature_dict[feature])
+                else:
+                    feature_values.append(0.0)  # Default value for missing features
+            
+            # Verify feature count
+            if len(feature_values) != len(self.features):
+                print(f"[WARNING] Feature count mismatch in prediction. Expected {len(self.features)}, got {len(feature_values)}")
+                print(f"Features: {self.features}")
+                print(f"Values: {feature_values}")
+            
+            return feature_values
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to extract features: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
     def onShutDown(self):
-        pass
+        """Clean up when shutting down"""
+        self.collecting_data = False
+        if self.data_thread:
+            self.data_thread.join(timeout=1.0)
     
     def onRestart(self):
-        pass
+        """Handle restart"""
+        self.collecting_data = True
+        self.start_data_collection()
